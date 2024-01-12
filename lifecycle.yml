@@ -1,0 +1,170 @@
+---
+schemaVersion: '2.2'
+description: SSM Document Template for Amazon Data Lifecycle Manager Pre/Post script feature for InterSystems IRIS.
+parameters:
+  executionId:
+    type: String
+    default: None
+    description: Specifies the unique identifier associated with a pre and/or post execution
+    allowedPattern: ^(None|[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})$
+  command:
+    type: String
+    # Data Lifecycle Manager will trigger the pre-script and post-script actions. You can also use this SSM document with 'dry-run' for manual testing purposes.
+    default: 'dry-run'
+    description: (Required) Specifies whether pre-script and/or post-script should be executed.
+    #The following allowedValues will allow Data Lifecycle Manager to successfully trigger pre and post script actions.
+    allowedValues:
+    - pre-script
+    - post-script
+    - dry-run
+
+mainSteps:
+- action: aws:runShellScript
+  description: Run InterSystems IRIS Database freeze/thaw commands
+  name: run_pre_post_scripts
+  precondition:
+    StringEquals:
+    - platformType
+    - Linux
+  inputs:
+    runCommand:
+    - |
+      #!/bin/bash
+      ###===============================================================================###
+      ### Global variables
+      ###===============================================================================###
+      DOCKER_NAME=iris
+      LOGDIR=./
+      EXIT_CODE=0
+      OPERATION={{ command }}
+      START=$(date +%s)
+      
+      # Check if Docker is installed
+      # By default if Docker is present, script assumes that InterSystems IRIS is running in Docker
+      # Leave only the else block DOCKER_EXEC line, if you run InterSystems IRIS non-containerised (and Docker is present).
+      # Script assumes irissys user has OS auth enabled, change the OS user or supply login/password depending on your configuration.
+      if command -v docker &> /dev/null
+      then
+        DOCKER_EXEC="docker exec $DOCKER_NAME"
+      else
+        DOCKER_EXEC="sudo -i -u irissys"
+      fi
+      
+                    
+      # Add all pre-script actions to be performed within the function below
+      execute_pre_script() {
+        echo "INFO: Start execution of pre-script"
+        
+        # find all iris running instances
+        iris_instances=$($DOCKER_EXEC iris qall 2>/dev/null | tail -n +3 | grep '^up' | cut -c5-  | awk '{print $1}')
+        echo "`date`: Running iris instances $iris_instances"
+      
+        # Only for running instances
+        for INST in $iris_instances; do
+      
+          echo "`date`: Attempting to freeze $INST"
+      
+          # Detailed instances specific log
+          LOGFILE=$LOGDIR/$INST-pre_post.log
+          
+          #check Freeze status before starting
+          $DOCKER_EXEC irissession $INST -U '%SYS' "##Class(Backup.General).IsWDSuspendedExt()"
+          freeze_status=$?
+          if [ $freeze_status -eq 5 ]; then
+            echo "`date`:   ERROR: $INST IS already FROZEN"
+            EXIT_CODE=204
+          else
+            echo "`date`:   $INST is not frozen"
+            # Freeze
+            # Docs: https://docs.intersystems.com/irislatest/csp/documatic/%25CSP.Documatic.cls?LIBRARY=%25SYS&CLASSNAME=Backup.General#ExternalFreeze
+            $DOCKER_EXEC irissession $INST -U '%SYS' "##Class(Backup.General).ExternalFreeze(\"$LOGFILE\",,,,,,600,,,300)"
+            status=$?
+      
+            case $status in
+              5) echo "`date`:   $INST IS FROZEN"
+                ;;
+              3) echo "`date`:   $INST FREEZE FAILED"
+                EXIT_CODE=201
+                ;;
+              *) echo "`date`:   ERROR: Unknown status code: $status"
+                EXIT_CODE=201
+                ;;
+            esac
+            echo "`date`:   Completed freeze of $INST"
+          fi
+        done
+        echo "`date`: Pre freeze script finished"
+      }
+                    
+      # Add all post-script actions to be performed within the function below
+      execute_post_script() {
+        echo "INFO: Start execution of post-script"
+      
+        # find all iris running instances
+        iris_instances=$($DOCKER_EXEC iris qall 2>/dev/null | tail -n +3 | grep '^up' | cut -c5-  | awk '{print $1}')
+        echo "`date`: Running iris instances $iris_instances"
+      
+        # Only for running instances
+        for INST in $iris_instances; do
+      
+          echo "`date`: Attempting to thaw $INST"
+      
+          # Detailed instances specific log
+          LOGFILE=$LOGDIR/$INST-pre_post.log
+      
+          #check Freeze status befor starting
+          $DOCKER_EXEC irissession $INST -U '%SYS' "##Class(Backup.General).IsWDSuspendedExt()"
+          freeze_status=$?
+          if [ $freeze_status -eq 5 ]; then
+            echo "`date`:  $INST is in frozen state"
+            # Thaw
+            # Docs: https://docs.intersystems.com/irislatest/csp/documatic/%25CSP.Documatic.cls?LIBRARY=%25SYS&CLASSNAME=Backup.General#ExternalFreeze
+            $DOCKER_EXEC irissession $INST -U%SYS "##Class(Backup.General).ExternalThaw(\"$LOGFILE\")"
+            status=$?
+      
+            case $status in
+              5) echo "`date`:   $INST IS THAWED"
+                  $DOCKER_EXEC irissession $INST -U%SYS "##Class(Backup.General).ExternalSetHistory(\"$LOGFILE\")"
+                ;;
+              3) echo "`date`:   $INST THAW FAILED"
+                  EXIT_CODE=202
+                ;;
+              *) echo "`date`:   ERROR: Unknown status code: $status"
+                  EXIT_CODE=202
+                ;;
+            esac
+            echo "`date`:   Completed thaw of $INST"
+          else
+            echo "`date`:   ERROR: $INST IS already THAWED"
+            EXIT_CODE=205
+          fi
+        done
+        echo "`date`: Post thaw script finished"
+      }
+      
+      # Debug logging for parameters passed to the SSM document
+        echo "INFO: ${OPERATION} starting at $(date) with executionId: ${EXECUTION_ID}"
+                    
+      # Based on the command parameter value execute the function that supports 
+      # pre-script/post-script operation
+      case ${OPERATION} in
+        pre-script)
+          execute_pre_script
+          ;;
+        post-script)
+          execute_post_script
+            ;;
+        dry-run)
+          echo "INFO: dry-run option invoked - taking no action"
+          ;;
+        *)
+          echo "ERROR: Invalid command parameter passed. Please use either pre-script, post-script, dry-run."
+          # return failure
+          EXIT_CODE=1
+          ;;
+      esac
+                    
+      END=$(date +%s)
+      # Debug Log for profiling the script time
+      echo "INFO: ${OPERATION} completed at $(date). Total runtime: $((${END} - ${START})) seconds."
+      exit $EXIT_CODE
